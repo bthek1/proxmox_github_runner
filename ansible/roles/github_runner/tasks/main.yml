@@ -25,6 +25,14 @@
 - name: Install base packages
   ansible.builtin.include_tasks: packages.yml
 
+- name: Ensure the configuration directory exists
+  ansible.builtin.file:
+    path: "{{ github_runner_conf_dir }}"
+    state: directory
+    owner: root
+    group: root
+    mode: "0700"
+
 - name: Configure DNS resilience
   ansible.builtin.include_tasks: dns.yml
 
@@ -35,14 +43,6 @@
     home: "{{ github_runner_home }}"
     create_home: true
     state: present
-
-- name: Ensure the configuration directory exists
-  ansible.builtin.file:
-    path: "{{ github_runner_conf_dir }}"
-    state: directory
-    owner: root
-    group: root
-    mode: "0700"
 
 - name: Store the GitHub PAT for unattended self re-registration
   ansible.builtin.copy:

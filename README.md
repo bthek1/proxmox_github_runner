@@ -188,6 +188,19 @@ just fmt              # format all .tf files
 
 ---
 
+## When something breaks
+
+See the runbook: **[docs/RUNNER_OPERATIONS.md](docs/RUNNER_OPERATIONS.md)** —
+symptom-to-fix tables, recovery procedures, what runs on the box, and the known
+limitations of this setup.
+
+```bash
+just health       # first response: on-box verdict, exit 0 = healthy
+just health-log   # what the timers have been doing
+```
+
+---
+
 ## Verify
 
 After a successful apply, the runner appears in:

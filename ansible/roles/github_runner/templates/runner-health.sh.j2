@@ -171,5 +171,11 @@ if [ "$degraded" = 1 ]; then
 fi
 
 date -u +%FT%TZ > "${STATE_DIR}/last-healthy"
-info "healthy: connectivity ok, all runners active and registered, disk at ${usage}%"
+if [ -r "${CONF_DIR}/pat" ]; then
+  reg_note="registered with GitHub"
+else
+  # Be explicit rather than implying a check that did not happen.
+  reg_note="registration NOT verified (no PAT — set github_pat to enable)"
+fi
+info "healthy: connectivity ok, all runners active, ${reg_note}, disk at ${usage}%"
 exit 0

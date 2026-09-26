@@ -22,7 +22,7 @@
   ansible.builtin.command:
     argv:
       - "{{ github_runner_bin_dir }}/gh-runner-token"
-      - "{{ (retired_state.content | b64decode | from_json).gitHubUrl }}"
+      - "{{ (retired_state.content | b64decode | regex_replace('^\\uFEFF', '') | from_json).gitHubUrl }}"
       - remove
   register: retired_removal_token
   changed_when: false

@@ -53,3 +53,22 @@ export PROXMOX_VE_ENDPOINT="https://<proxmox-host>:8006/"
 - Always show the plan output before applying
 - Never auto-apply without user confirmation unless explicitly asked
 - Destroy operations (`terraform destroy`) are out of scope for this skill — run manually
+- **Check the plan for `must be replaced`.** Some `bpg/proxmox` attributes are
+  ForceNew (notably `datastore_id`) and will destroy a container that has live
+  state on it. Stop and ask rather than applying.
+
+## In this repo, apply does more than Terraform
+
+`terraform apply` here also triggers `null_resource.runner_provision`, which runs
+`ansible-playbook` against the live runner container. Consequences:
+
+- The apply reconfigures a machine that may be executing CI jobs. The Ansible
+  role drains each runner first, so nothing is killed — but the apply can block
+  for up to 30 minutes waiting on a long job.
+- Ansible task output is **suppressed** in the apply log, because the
+  provisioner's `environment` carries sensitive values. Verify the outcome from
+  the host afterwards: `just health`, `just runner-services`, `just runners`.
+- If only in-container configuration changed, prefer `just converge` — it needs
+  no Proxmox credentials and no registration tokens.
+
+See [RUNNER_OPERATIONS.md](../../../docs/RUNNER_OPERATIONS.md).

@@ -15,12 +15,17 @@
   failed_when: false
 
 - name: "{{ runner.name }} | determine current registration"
+  vars:
+    # The runner writes .runner with a UTF-8 BOM, which from_json rejects
+    # (jq tolerates it, so this only bites here). Strip it before parsing.
+    _runner_json: >-
+      {{ (runner_state.content | b64decode | regex_replace('^\uFEFF', '') | from_json)
+         if runner_state.content is defined else {} }}
   ansible.builtin.set_fact:
     runner_registered: >-
-      {{ (runner_state.content is defined)
-         and ((runner_state.content | b64decode | from_json).gitHubUrl | default('') | regex_replace('/$', ''))
+      {{ (_runner_json.gitHubUrl | default('') | regex_replace('/$', ''))
              == (runner.target | regex_replace('/$', ''))
-         and (runner_state.content | b64decode | from_json).agentName | default('') == runner.name }}
+         and (_runner_json.agentName | default('')) == runner.name }}
     runner_unit: >-
       {{ (runner_service_file.content | b64decode | trim)
          if runner_service_file.content is defined else '' }}
