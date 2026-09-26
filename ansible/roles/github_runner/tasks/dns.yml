@@ -1,0 +1,47 @@
+---
+# Proxmox owns /etc/resolv.conf and rewrites it from the *node's* DNS on every
+# container start. Terraform now pins the servers via the container's own DNS
+# setting, but that only helps while Proxmox agrees. Keep a known-good copy on
+# disk so the health check can restore resolution without a human.
+# See docs/incidents/2026-05-14-dns-outage.md.
+
+- name: Store the known-good resolver configuration
+  ansible.builtin.copy:
+    content: |
+      # Managed by ansible/roles/github_runner. Restored by runner-health.sh
+      # when DNS resolution breaks. See docs/incidents/2026-05-14-dns-outage.md.
+      {% for server in dns_servers %}
+      nameserver {{ server }}
+      {% endfor %}
+      options timeout:2 attempts:2
+    dest: "{{ github_runner_conf_dir }}/resolv.conf.known-good"
+    owner: root
+    group: root
+    mode: "0644"
+
+- name: Check current DNS resolution
+  ansible.builtin.command:
+    argv: [getent, hosts, github.com]
+  register: dns_probe
+  changed_when: false
+  failed_when: false
+
+- name: Restore resolver configuration when resolution is broken
+  ansible.builtin.copy:
+    src: "{{ github_runner_conf_dir }}/resolv.conf.known-good"
+    dest: /etc/resolv.conf
+    remote_src: true
+    owner: root
+    group: root
+    mode: "0644"
+  when: dns_probe.rc != 0
+
+- name: Re-check DNS resolution after restore
+  ansible.builtin.command:
+    argv: [getent, hosts, github.com]
+  register: dns_recheck
+  changed_when: false
+  retries: 3
+  delay: 5
+  until: dns_recheck.rc == 0
+  when: dns_probe.rc != 0

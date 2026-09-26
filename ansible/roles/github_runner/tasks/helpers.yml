@@ -1,0 +1,11 @@
+---
+- name: Install on-box helper scripts
+  ansible.builtin.template:
+    src: "{{ item }}.sh.j2"
+    dest: "{{ github_runner_bin_dir }}/{{ item }}"
+    owner: root
+    group: root
+    mode: "0750"
+  loop:
+    - gh-runner-token
+    - gh-runner-drain

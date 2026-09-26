@@ -1,0 +1,46 @@
+---
+- name: Install the health check script
+  ansible.builtin.template:
+    src: runner-health.sh.j2
+    dest: "{{ github_runner_bin_dir }}/runner-health"
+    owner: root
+    group: root
+    mode: "0750"
+  register: health_script
+
+- name: Install the health check unit and timer
+  ansible.builtin.template:
+    src: "runner-health.{{ item }}.j2"
+    dest: "/etc/systemd/system/runner-health.{{ item }}"
+    owner: root
+    group: root
+    mode: "0644"
+  loop: [service, timer]
+  register: health_units
+
+- name: Reload systemd for the health check
+  ansible.builtin.systemd_service:
+    daemon_reload: true
+  when: health_units is changed
+
+- name: Enable the health check timer
+  ansible.builtin.systemd_service:
+    name: runner-health.timer
+    enabled: true
+    state: started
+
+- name: Run the health check once to prove it works
+  ansible.builtin.command:
+    argv: ["{{ github_runner_bin_dir }}/runner-health"]
+  register: health_run
+  changed_when: false
+  failed_when: false
+
+- name: Show the health check result
+  ansible.builtin.debug:
+    var: health_run.stdout_lines
+
+- name: Fail when the initial health check reports unresolved problems
+  ansible.builtin.fail:
+    msg: "Health check exited {{ health_run.rc }}:\n{{ health_run.stdout }}\n{{ health_run.stderr }}"
+  when: health_run.rc != 0

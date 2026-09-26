@@ -1,0 +1,232 @@
+---
+# Converge a single runner. Every runner is evaluated and, if needed, repaired
+# independently: a failure here costs one runner, not the whole fleet.
+
+- name: "{{ runner.name }} | read existing registration"
+  ansible.builtin.slurp:
+    src: "{{ runner.dir }}/.runner"
+  register: runner_state
+  failed_when: false
+
+- name: "{{ runner.name }} | read installed service name"
+  ansible.builtin.slurp:
+    src: "{{ runner.dir }}/.service"
+  register: runner_service_file
+  failed_when: false
+
+- name: "{{ runner.name }} | determine current registration"
+  ansible.builtin.set_fact:
+    runner_registered: >-
+      {{ (runner_state.content is defined)
+         and ((runner_state.content | b64decode | from_json).gitHubUrl | default('') | regex_replace('/$', ''))
+             == (runner.target | regex_replace('/$', ''))
+         and (runner_state.content | b64decode | from_json).agentName | default('') == runner.name }}
+    runner_unit: >-
+      {{ (runner_service_file.content | b64decode | trim)
+         if runner_service_file.content is defined else '' }}
+
+- name: "{{ runner.name }} | check service state"
+  ansible.builtin.command:
+    argv: [systemctl, is-active, "{{ runner_unit }}"]
+  register: runner_active
+  changed_when: false
+  failed_when: false
+  when: runner_unit | length > 0
+
+- name: "{{ runner.name }} | decide whether reconfiguration is needed"
+  ansible.builtin.set_fact:
+    runner_needs_config: >-
+      {{ (not runner_registered)
+         or (runner_unit | length == 0)
+         or (runner_active.rc | default(1)) != 0 }}
+
+- name: "{{ runner.name }} | already converged"
+  ansible.builtin.debug:
+    msg: "registered against {{ runner.target }}, {{ runner_unit }} active — no action"
+  when: not runner_needs_config
+
+# ── Reconfiguration path ─────────────────────────────────────────────────────
+
+- name: "{{ runner.name }} | obtain a registration token"
+  when: runner_needs_config
+  block:
+    - name: "{{ runner.name }} | mint a registration token from the PAT"
+      ansible.builtin.command:
+        argv: ["{{ github_runner_bin_dir }}/gh-runner-token", "{{ runner.target }}", register]
+      register: minted_token
+      changed_when: false
+      failed_when: false
+      when: github_pat | length > 0
+      no_log: true
+
+    - name: "{{ runner.name }} | select the token to use"
+      ansible.builtin.set_fact:
+        runner_token: >-
+          {{ (minted_token.stdout | default('') | trim)
+             if (github_pat | length > 0 and (minted_token.rc | default(1)) == 0)
+             else runner.token }}
+      no_log: true
+
+    - name: "{{ runner.name }} | fail clearly when no token is available"
+      ansible.builtin.fail:
+        msg: >-
+          {{ runner.name }} needs (re)registration against {{ runner.target }}
+          but no token is available. Supply GH_RUNNER_TOKENS (one token per
+          target, in github_runner_targets order) or set github_pat so the host
+          can mint its own.
+      when: runner_token | length == 0
+
+- name: "{{ runner.name }} | converge"
+  when: runner_needs_config
+  block:
+    - name: "{{ runner.name }} | wait for any in-flight job to finish"
+      ansible.builtin.command:
+        argv:
+          - "{{ github_runner_bin_dir }}/gh-runner-drain"
+          - "{{ runner.dir }}"
+          - "{{ drain_timeout }}"
+      changed_when: false
+
+    - name: "{{ runner.name }} | stop and uninstall the existing service"
+      ansible.builtin.command:
+        argv: [./svc.sh, uninstall]
+        chdir: "{{ runner.dir }}"
+      register: svc_uninstall
+      changed_when: svc_uninstall.rc == 0
+      failed_when: false
+      when: runner_unit | length > 0
+
+    - name: "{{ runner.name }} | mint a removal token"
+      ansible.builtin.command:
+        argv: ["{{ github_runner_bin_dir }}/gh-runner-token", "{{ runner.target }}", remove]
+      register: removal_token
+      changed_when: false
+      failed_when: false
+      when:
+        - github_pat | length > 0
+        - runner_state.content is defined
+      no_log: true
+
+    - name: "{{ runner.name }} | deregister the stale runner from GitHub"
+      ansible.builtin.command:
+        argv: [./config.sh, remove, --token, "{{ removal_token.stdout | trim }}"]
+        chdir: "{{ runner.dir }}"
+      become: true
+      become_user: "{{ github_runner_user }}"
+      register: config_remove
+      # Best-effort: a runner GitHub already dropped cannot be removed, and
+      # --replace on the next register handles the name collision regardless.
+      changed_when: config_remove.rc == 0
+      failed_when: false
+      when: (removal_token.rc | default(1)) == 0
+      no_log: true
+
+    - name: "{{ runner.name }} | ensure the runner directory exists"
+      ansible.builtin.file:
+        path: "{{ runner.dir }}"
+        state: directory
+        owner: "{{ github_runner_user }}"
+        group: "{{ github_runner_user }}"
+        mode: "0755"
+
+    - name: "{{ runner.name }} | unpack the runner binaries"
+      ansible.builtin.unarchive:
+        src: "{{ github_runner_home }}/runner-src/actions-runner-{{ github_runner_version }}.tar.gz"
+        dest: "{{ runner.dir }}"
+        remote_src: true
+        owner: "{{ github_runner_user }}"
+        group: "{{ github_runner_user }}"
+        creates: "{{ runner.dir }}/config.sh"
+
+    - name: "{{ runner.name }} | fix ownership of the runner directory"
+      ansible.builtin.file:
+        path: "{{ runner.dir }}"
+        state: directory
+        owner: "{{ github_runner_user }}"
+        group: "{{ github_runner_user }}"
+        recurse: true
+
+    - name: "{{ runner.name }} | register with GitHub"
+      ansible.builtin.command:
+        argv:
+          - ./config.sh
+          - --unattended
+          - --replace
+          - --url
+          - "{{ runner.target }}"
+          - --token
+          - "{{ runner_token }}"
+          - --name
+          - "{{ runner.name }}"
+          - --labels
+          - "{{ github_runner_labels | join(',') }}"
+          - --work
+          - _work
+        chdir: "{{ runner.dir }}"
+      become: true
+      become_user: "{{ github_runner_user }}"
+      register: runner_config
+      changed_when: runner_config.rc == 0
+      no_log: true
+
+    - name: "{{ runner.name }} | install the systemd service"
+      ansible.builtin.command:
+        argv: [./svc.sh, install, "{{ github_runner_user }}"]
+        chdir: "{{ runner.dir }}"
+      register: svc_install
+      changed_when: svc_install.rc == 0
+
+    - name: "{{ runner.name }} | re-read the installed service name"
+      ansible.builtin.slurp:
+        src: "{{ runner.dir }}/.service"
+      register: runner_service_file
+
+    - name: "{{ runner.name }} | update the unit name"
+      ansible.builtin.set_fact:
+        runner_unit: "{{ runner_service_file.content | b64decode | trim }}"
+
+# ── Always-applied hardening ─────────────────────────────────────────────────
+
+- name: "{{ runner.name }} | ensure the systemd drop-in directory exists"
+  ansible.builtin.file:
+    path: "/etc/systemd/system/{{ runner_unit }}.d"
+    state: directory
+    owner: root
+    group: root
+    mode: "0755"
+  when: runner_unit | length > 0
+
+- name: "{{ runner.name }} | install the systemd hardening drop-in"
+  ansible.builtin.template:
+    src: runner-override.conf.j2
+    dest: "/etc/systemd/system/{{ runner_unit }}.d/override.conf"
+    owner: root
+    group: root
+    mode: "0644"
+  register: runner_override
+  when: runner_unit | length > 0
+
+- name: "{{ runner.name }} | reload systemd"
+  ansible.builtin.systemd_service:
+    daemon_reload: true
+  when: runner_override is changed
+
+- name: "{{ runner.name }} | drain before applying the drop-in"
+  ansible.builtin.command:
+    argv:
+      - "{{ github_runner_bin_dir }}/gh-runner-drain"
+      - "{{ runner.dir }}"
+      - "{{ drain_timeout }}"
+  changed_when: false
+  when: runner_override is changed and not runner_needs_config
+
+- name: "{{ runner.name }} | enable and start the service"
+  ansible.builtin.systemd_service:
+    name: "{{ runner_unit }}"
+    enabled: true
+    state: "{{ 'restarted' if (runner_override is changed and not runner_needs_config) else 'started' }}"
+  when: runner_unit | length > 0
+
+- name: "{{ runner.name }} | clear the per-instance token"
+  ansible.builtin.set_fact:
+    runner_token: ""

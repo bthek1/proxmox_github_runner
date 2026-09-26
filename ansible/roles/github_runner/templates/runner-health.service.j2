@@ -1,0 +1,10 @@
+# Managed by ansible/roles/github_runner — do not edit by hand.
+[Unit]
+Description=GitHub Actions runner health check and self-repair
+After=network-online.target
+Wants=network-online.target
+
+[Service]
+Type=oneshot
+ExecStart={{ github_runner_bin_dir }}/runner-health
+TimeoutStartSec={{ (drain_timeout | int) + 600 }}

@@ -1,0 +1,113 @@
+---
+- name: Validate inputs
+  ansible.builtin.assert:
+    that:
+      - github_runner_targets | length > 0
+      - github_runner_parallel | int >= 1
+      - dns_servers | length > 0
+    fail_msg: >-
+      github_runner_targets must be non-empty, github_runner_parallel >= 1,
+      and dns_servers must not be empty.
+    quiet: true
+
+- name: Build the desired runner fleet
+  ansible.builtin.set_fact:
+    runner_instances: >-
+      {{ lookup('ansible.builtin.template', 'fleet.json.j2') | from_json }}
+
+- name: Report the desired fleet
+  ansible.builtin.debug:
+    msg: >-
+      {{ runner_instances | length }} runner(s) desired across
+      {{ github_runner_targets | length }} target(s)
+      ({{ github_runner_parallel }} per target)
+
+- name: Install base packages
+  ansible.builtin.include_tasks: packages.yml
+
+- name: Configure DNS resilience
+  ansible.builtin.include_tasks: dns.yml
+
+- name: Ensure the runner OS user exists
+  ansible.builtin.user:
+    name: "{{ github_runner_user }}"
+    shell: /bin/bash
+    home: "{{ github_runner_home }}"
+    create_home: true
+    state: present
+
+- name: Ensure the configuration directory exists
+  ansible.builtin.file:
+    path: "{{ github_runner_conf_dir }}"
+    state: directory
+    owner: root
+    group: root
+    mode: "0700"
+
+- name: Store the GitHub PAT for unattended self re-registration
+  ansible.builtin.copy:
+    content: "{{ github_pat }}\n"
+    dest: "{{ github_runner_conf_dir }}/pat"
+    owner: root
+    group: root
+    mode: "0600"
+  when: github_pat | length > 0
+  no_log: true
+
+- name: Warn when no PAT is available
+  ansible.builtin.debug:
+    msg: >-
+      No github_pat supplied — the health check can restart runners but cannot
+      re-register one that GitHub has dropped. Recovery will need a human.
+  when: github_pat | length == 0
+
+- name: Install on-box helper scripts
+  ansible.builtin.include_tasks: helpers.yml
+
+- name: Fetch the runner release archive
+  ansible.builtin.get_url:
+    url: >-
+      https://github.com/actions/runner/releases/download/v{{ github_runner_version }}/actions-runner-linux-x64-{{ github_runner_version }}.tar.gz
+    dest: "{{ github_runner_home }}/runner-src/actions-runner-{{ github_runner_version }}.tar.gz"
+    owner: "{{ github_runner_user }}"
+    group: "{{ github_runner_user }}"
+    mode: "0644"
+    # Versioned filename, so an existing file is byte-identical — never re-fetch.
+    force: false
+  register: runner_archive
+  retries: 5
+  delay: 10
+  until: runner_archive is succeeded
+
+- name: Converge each runner instance
+  ansible.builtin.include_tasks: instance.yml
+  loop: "{{ runner_instances }}"
+  loop_control:
+    loop_var: runner
+    label: "{{ runner.name }} -> {{ runner.target }}"
+
+- name: Retire runners beyond the desired fleet
+  ansible.builtin.include_tasks: retire.yml
+
+- name: Install the self-healing health check
+  ansible.builtin.include_tasks: health.yml
+
+- name: Install disk cleanup
+  ansible.builtin.include_tasks: cleanup.yml
+
+- name: Collect runner service states
+  ansible.builtin.command:
+    argv: [systemctl, list-units, "actions.runner.*", --all, --no-legend, --plain]
+  register: runner_units
+  changed_when: false
+
+- name: Fail if any runner service is not running
+  ansible.builtin.assert:
+    that:
+      - runner_units.stdout_lines | select('search', 'running') | list | length == runner_instances | length
+    fail_msg: |-
+      Expected {{ runner_instances | length }} running runner services, found
+      {{ runner_units.stdout_lines | select('search', 'running') | list | length }}:
+      {{ runner_units.stdout }}
+    success_msg: "All {{ runner_instances | length }} runner services are running."
+    quiet: true

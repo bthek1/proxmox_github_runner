@@ -1,0 +1,11 @@
+# Managed by ansible/roles/github_runner — do not edit by hand.
+[Unit]
+Description=Reclaim disk space used by GitHub Actions runners
+
+[Service]
+Type=oneshot
+ExecStart={{ github_runner_bin_dir }}/runner-cleanup
+# Cleanup competes with running jobs for IO; keep it out of their way.
+IOSchedulingClass=idle
+Nice=10
+TimeoutStartSec=3600

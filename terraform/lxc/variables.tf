@@ -191,9 +191,18 @@ variable "github_runner_targets" {
 }
 
 variable "github_runner_tokens" {
-  description = "Comma-separated registration tokens, one per target URL in github_runner_targets order (expires in 1 hour)."
+  description = <<-EOT
+    Comma-separated registration tokens, one per target URL in
+    github_runner_targets order (each expires after 1 hour).
+
+    Optional: the Ansible role only needs a token for a runner that is not yet
+    registered, so an ordinary convergence run (config tweak, health-check
+    update, drift repair) works with this empty. Tokens are only required when
+    adding a target, raising github_runner_parallel, or rebuilding the host.
+  EOT
   type        = string
   sensitive   = true
+  default     = ""
 }
 
 variable "github_runner_name" {
@@ -224,4 +233,96 @@ variable "github_runner_parallel" {
   description = "Number of parallel runner instances to register per target (enables concurrent job execution)."
   type        = number
   default     = 2
+}
+
+# ── DNS ───────────────────────────────────────────────────────────────────────
+
+variable "dns_servers" {
+  description = <<-EOT
+    DNS servers written into the container's /etc/resolv.conf by Proxmox.
+
+    Pinning these here is deliberate: Proxmox rewrites the container's
+    /etc/resolv.conf from the *node's* DNS configuration on every container
+    start. On 2026-05-13 the node's DNS pointed at an unreachable WireGuard
+    gateway (10.8.0.1) and every runner silently stopped picking up jobs for
+    ~1.5 days while still reporting `active (running)`.
+    See docs/incidents/2026-05-14-dns-outage.md.
+  EOT
+  type        = list(string)
+  default     = ["1.1.1.1", "8.8.8.8"]
+
+  validation {
+    condition     = length(var.dns_servers) > 0
+    error_message = "At least one DNS server must be set; an empty list lets the Proxmox node's DNS win."
+  }
+}
+
+variable "dns_domain" {
+  description = "DNS search domain for the container. Empty leaves it unset."
+  type        = string
+  default     = ""
+}
+
+# ── Provisioning ──────────────────────────────────────────────────────────────
+
+variable "github_pat" {
+  description = <<-EOT
+    Optional GitHub PAT (repo + workflow scope) stored on the container at
+    /etc/github-runner/pat, mode 0600. When present the on-box health check can
+    mint its own registration token and re-register a runner that GitHub has
+    dropped, without anyone running `terraform apply`. Leave empty to disable
+    self re-registration (the health check then only restarts services).
+  EOT
+  type        = string
+  sensitive   = true
+  default     = ""
+}
+
+variable "ansible_playbook" {
+  description = "Path (relative to repo root) of the playbook that provisions the runners."
+  type        = string
+  default     = "ansible/playbooks/runners.yml"
+}
+
+variable "run_ansible" {
+  description = "Run the Ansible provisioning playbook as part of `terraform apply`. Set false to manage infra only."
+  type        = bool
+  default     = true
+}
+
+variable "health_check_interval" {
+  description = "How often the on-box runner health check runs (systemd OnUnitActiveSec syntax)."
+  type        = string
+  default     = "5min"
+}
+
+variable "cleanup_schedule" {
+  description = "When the on-box disk cleanup runs (systemd OnCalendar syntax)."
+  type        = string
+  default     = "daily"
+}
+
+variable "work_dir_retention_days" {
+  description = "Delete runner _work job directories untouched for this many days."
+  type        = number
+  default     = 7
+}
+
+variable "disk_warn_percent" {
+  description = "Root filesystem usage percentage above which cleanup escalates to aggressive pruning."
+  type        = number
+  default     = 80
+}
+
+variable "runner_memory_max" {
+  description = <<-EOT
+    Optional per-runner systemd MemoryMax, e.g. "2G". When set, a runaway job
+    is killed instead of the runner service that supervises it.
+
+    Empty by default: capping memory only makes sense alongside a decision
+    about CPU/RAM oversubscription (9 runners currently share 4 cores), which
+    is a separate change.
+  EOT
+  type        = string
+  default     = ""
 }

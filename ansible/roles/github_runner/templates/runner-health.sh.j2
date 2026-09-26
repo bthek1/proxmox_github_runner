@@ -1,0 +1,175 @@
+#!/usr/bin/env bash
+# runner-health — detect and repair the failure modes that leave runners
+# reporting `active (running)` while doing nothing.
+#
+# On 2026-05-13 every runner was green for ~1.5 days while DNS pointed at an
+# unreachable WireGuard gateway. `systemctl status` was clean the whole time.
+# This checks the path jobs actually depend on, in escalating order:
+#
+#   1. name resolution        -> restore the pinned resolv.conf
+#   2. GitHub API reachable   -> restart every runner once connectivity returns
+#   3. per-runner liveness    -> restart a stopped service
+#   4. per-runner registration-> re-register from the PAT if GitHub dropped it
+#   5. disk headroom          -> trigger cleanup before a full disk breaks jobs
+#
+# Everything is logged to the journal under the `runner-health` tag.
+set -uo pipefail
+
+CONF_DIR="{{ github_runner_conf_dir }}"
+BIN_DIR="{{ github_runner_bin_dir }}"
+RUNNER_USER="{{ github_runner_user }}"
+RUNNER_HOME="{{ github_runner_home }}"
+RUNNER_LABELS="{{ github_runner_labels | join(',') }}"
+KNOWN_GOOD="${CONF_DIR}/resolv.conf.known-good"
+DISK_WARN={{ disk_warn_percent }}
+DRAIN_TIMEOUT={{ drain_timeout }}
+STATE_DIR=/var/lib/github-runner
+mkdir -p "$STATE_DIR"
+
+log()  { logger -t runner-health -p "user.${1}" -- "${2}"; echo "[${1}] ${2}"; }
+info() { log info "$1"; }
+warn() { log warning "$1"; }
+err()  { log err "$1"; }
+
+degraded=0
+
+# ── 1 & 2: connectivity ──────────────────────────────────────────────────────
+
+resolves() { getent hosts github.com >/dev/null 2>&1; }
+api_up()   { curl -sf -m 15 -o /dev/null https://api.github.com; }
+
+connectivity_ok() { resolves && api_up; }
+
+if ! connectivity_ok; then
+  warn "connectivity check failed (dns=$(resolves && echo ok || echo fail) api=$(api_up && echo ok || echo fail))"
+
+  if ! resolves && [ -r "$KNOWN_GOOD" ]; then
+    # Proxmox rewrites /etc/resolv.conf from the node's DNS on container start.
+    if ! cmp -s "$KNOWN_GOOD" /etc/resolv.conf; then
+      warn "restoring pinned resolv.conf (was: $(tr -s '[:space:]' ' ' < /etc/resolv.conf))"
+      cp "$KNOWN_GOOD" /etc/resolv.conf
+    fi
+  fi
+
+  recovered=0
+  for _ in 1 2 3 4 5 6; do
+    if connectivity_ok; then recovered=1; break; fi
+    sleep 5
+  done
+
+  if [ "$recovered" = 1 ]; then
+    info "connectivity recovered; restarting all runner services so they re-establish long polls"
+    systemctl restart 'actions.runner.*' 2>/dev/null || true
+    # Runners that were mid-outage need a moment before liveness checks mean anything.
+    sleep 20
+  else
+    err "connectivity still down after resolver repair — upstream network or GitHub outage, not a runner fault"
+    exit 1
+  fi
+fi
+
+# ── 3 & 4: per-runner liveness and registration ──────────────────────────────
+
+# Runner names GitHub currently knows about, per target. Cached per run so a
+# fleet of N runners costs one API call per target, not N.
+declare -A KNOWN_RUNNERS
+api_scope() {
+  local path="${1#*://}"; path="${path#*/}"; path="${path%/}"; path="${path%.git}"
+  case "$path" in
+    */*) printf 'repos/%s' "$path" ;;
+    "")  return 1 ;;
+    *)   printf 'orgs/%s' "$path" ;;
+  esac
+}
+
+load_known_runners() {
+  local target="$1" scope names
+  [ -n "${KNOWN_RUNNERS[$target]+set}" ] && return 0
+  [ -r "${CONF_DIR}/pat" ] || return 1
+  scope="$(api_scope "$target")" || return 1
+  names="$(curl -fsS -m 30 \
+      -H "Authorization: Bearer $(tr -d '[:space:]' < "${CONF_DIR}/pat")" \
+      -H "Accept: application/vnd.github+json" \
+      -H "X-GitHub-Api-Version: 2022-11-28" \
+      "https://api.github.com/${scope}/actions/runners?per_page=100" \
+      | jq -r '.runners[].name' 2>/dev/null)" || return 1
+  KNOWN_RUNNERS[$target]=$'\n'"${names}"$'\n'
+  return 0
+}
+
+reregister() {
+  local dir="$1" target="$2" name="$3" token unit
+  if ! token="$("${BIN_DIR}/gh-runner-token" "$target" register 2>/dev/null)"; then
+    err "${name}: needs re-registration but no PAT is configured — manual \`just runner-apply\` required"
+    return 1
+  fi
+
+  "${BIN_DIR}/gh-runner-drain" "$dir" "$DRAIN_TIMEOUT" >/dev/null 2>&1 || true
+  ( cd "$dir" && ./svc.sh uninstall ) >/dev/null 2>&1 || true
+  ( cd "$dir" && sudo -u "$RUNNER_USER" ./config.sh --unattended --replace \
+      --url "$target" --token "$token" --name "$name" \
+      --labels "$RUNNER_LABELS" --work _work ) >/dev/null 2>&1 || {
+    err "${name}: config.sh failed during re-registration"
+    return 1
+  }
+  ( cd "$dir" && ./svc.sh install "$RUNNER_USER" ) >/dev/null 2>&1 || true
+  systemctl daemon-reload
+  unit="$(cat "${dir}/.service" 2>/dev/null || true)"
+  [ -n "$unit" ] && systemctl enable --now "$unit" >/dev/null 2>&1
+  info "${name}: re-registered against ${target} and restarted"
+  return 0
+}
+
+for dir in "${RUNNER_HOME}"/actions-runner-*; do
+  [ -d "$dir" ] || continue
+  [ -f "${dir}/.runner" ] || { warn "$(basename "$dir"): no .runner file — not configured, skipping"; degraded=1; continue; }
+
+  target="$(jq -r '.gitHubUrl // empty' "${dir}/.runner")"
+  name="$(jq -r '.agentName // empty' "${dir}/.runner")"
+  unit="$(cat "${dir}/.service" 2>/dev/null || true)"
+
+  # 3. Service should be running.
+  if [ -z "$unit" ] || ! systemctl is-active --quiet "$unit"; then
+    warn "${name:-$(basename "$dir")}: service not active (unit='${unit}') — restarting"
+    if [ -n "$unit" ]; then
+      systemctl reset-failed "$unit" >/dev/null 2>&1 || true
+      systemctl restart "$unit" >/dev/null 2>&1 || true
+      sleep 5
+    fi
+    if [ -z "$unit" ] || ! systemctl is-active --quiet "$unit"; then
+      warn "${name}: restart did not take — attempting re-registration"
+      reregister "$dir" "$target" "$name" || degraded=1
+      continue
+    fi
+    info "${name}: restarted successfully"
+  fi
+
+  # 4. GitHub should still know about it. A runner removed server-side keeps
+  #    its process alive locally and silently never receives work again.
+  if load_known_runners "$target"; then
+    case "${KNOWN_RUNNERS[$target]}" in
+      *$'\n'"${name}"$'\n'*) : ;;
+      *)
+        warn "${name}: GitHub no longer lists this runner for ${target} — re-registering"
+        reregister "$dir" "$target" "$name" || degraded=1
+        ;;
+    esac
+  fi
+done
+
+# ── 5: disk headroom ─────────────────────────────────────────────────────────
+
+usage="$(df --output=pcent / | tail -1 | tr -dc '0-9')"
+if [ -n "$usage" ] && [ "$usage" -ge "$DISK_WARN" ]; then
+  warn "root filesystem at ${usage}% (threshold ${DISK_WARN}%) — triggering cleanup"
+  systemctl start runner-cleanup.service --no-block 2>/dev/null || true
+fi
+
+if [ "$degraded" = 1 ]; then
+  err "health check finished with unresolved problems"
+  exit 1
+fi
+
+date -u +%FT%TZ > "${STATE_DIR}/last-healthy"
+info "healthy: connectivity ok, all runners active and registered, disk at ${usage}%"
+exit 0

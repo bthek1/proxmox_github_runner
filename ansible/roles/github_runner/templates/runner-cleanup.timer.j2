@@ -1,0 +1,12 @@
+# Managed by ansible/roles/github_runner — do not edit by hand.
+[Unit]
+Description=Run GitHub Actions runner disk cleanup ({{ cleanup_schedule }})
+
+[Timer]
+OnCalendar={{ cleanup_schedule }}
+# Spread the load off the top of the hour and survive a powered-off window.
+RandomizedDelaySec=30min
+Persistent=true
+
+[Install]
+WantedBy=timers.target

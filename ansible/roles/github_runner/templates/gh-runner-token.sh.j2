@@ -1,0 +1,46 @@
+#!/usr/bin/env bash
+# gh-runner-token — mint a runner registration or removal token from the PAT.
+#
+# Usage: gh-runner-token <target-url> [register|remove]
+#
+# Exists so the box can recover on its own. Registration tokens live for one
+# hour, so anything that depends on a human pasting a fresh one is not a
+# recovery path — it is an outage with extra steps.
+set -euo pipefail
+
+TARGET="${1:?usage: gh-runner-token <target-url> [register|remove]}"
+KIND="${2:-register}"
+PAT_FILE="{{ github_runner_conf_dir }}/pat"
+
+[ -r "$PAT_FILE" ] || { echo "no PAT at $PAT_FILE" >&2; exit 78; }
+PAT="$(tr -d '[:space:]' < "$PAT_FILE")"
+[ -n "$PAT" ] || { echo "PAT file is empty" >&2; exit 78; }
+
+# https://github.com/owner/repo -> repos/owner/repo ; https://github.com/org -> orgs/org
+path="${TARGET#*://}"; path="${path#*/}"; path="${path%/}"; path="${path%.git}"
+case "$path" in
+  */*) scope="repos/$path" ;;
+  "")  echo "cannot parse target: $TARGET" >&2; exit 64 ;;
+  *)   scope="orgs/$path" ;;
+esac
+
+case "$KIND" in
+  register) endpoint="registration-token" ;;
+  remove)   endpoint="remove-token" ;;
+  *) echo "unknown token kind: $KIND" >&2; exit 64 ;;
+esac
+
+for attempt in 1 2 3; do
+  if body="$(curl -fsS -m 30 -X POST \
+        -H "Authorization: Bearer ${PAT}" \
+        -H "Accept: application/vnd.github+json" \
+        -H "X-GitHub-Api-Version: 2022-11-28" \
+        "https://api.github.com/${scope}/actions/runners/${endpoint}")"; then
+    token="$(printf '%s' "$body" | jq -r '.token // empty')"
+    if [ -n "$token" ]; then printf '%s\n' "$token"; exit 0; fi
+  fi
+  sleep $((attempt * 5))
+done
+
+echo "failed to mint ${KIND} token for ${TARGET}" >&2
+exit 1

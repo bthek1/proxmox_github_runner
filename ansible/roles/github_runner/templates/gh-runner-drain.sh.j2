@@ -1,0 +1,35 @@
+#!/usr/bin/env bash
+# gh-runner-drain — block until the runner in <dir> is not executing a job.
+#
+# Usage: gh-runner-drain <runner-dir> [timeout-seconds]
+#
+# A job runs as a Runner.Worker process whose cwd is the runner directory.
+# Waiting on that is what makes reconfiguration safe to run during CI: the old
+# provisioner stopped every service unconditionally and killed live jobs.
+set -euo pipefail
+
+DIR="${1:?usage: gh-runner-drain <runner-dir> [timeout]}"
+TIMEOUT="${2:-1800}"
+DIR="$(readlink -f "$DIR")"
+
+busy() {
+  local pid cwd
+  for pid in $(pgrep -x Runner.Worker 2>/dev/null || true); do
+    cwd="$(readlink -f "/proc/${pid}/cwd" 2>/dev/null || true)"
+    case "$cwd" in "$DIR"|"$DIR"/*) return 0 ;; esac
+  done
+  return 1
+}
+
+waited=0
+while busy; do
+  if [ "$waited" -ge "$TIMEOUT" ]; then
+    echo "runner in $DIR still busy after ${TIMEOUT}s" >&2
+    exit 1
+  fi
+  sleep 5
+  waited=$((waited + 5))
+done
+
+[ "$waited" -gt 0 ] && echo "drained $DIR after ${waited}s"
+exit 0

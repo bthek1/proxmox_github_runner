@@ -1,0 +1,23 @@
+---
+# Reducing github_runner_parallel, or dropping a target, used to leave orphan
+# services running and registered. They would sit in GitHub as Idle and pick up
+# jobs from a fleet that no longer intends to serve them.
+
+- name: Find runner directories present on the host
+  ansible.builtin.find:
+    paths: "{{ github_runner_home }}"
+    patterns: "actions-runner-*"
+    file_type: directory
+  register: present_runner_dirs
+
+- name: Identify runners to retire
+  ansible.builtin.set_fact:
+    retired_runner_dirs: >-
+      {{ present_runner_dirs.files | map(attribute='path') | list
+         | difference(runner_instances | map(attribute='dir') | list) }}
+
+- name: Retire each orphaned runner
+  ansible.builtin.include_tasks: retire_one.yml
+  loop: "{{ retired_runner_dirs }}"
+  loop_control:
+    loop_var: retired_dir

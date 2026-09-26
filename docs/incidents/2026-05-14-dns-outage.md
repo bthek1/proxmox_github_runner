@@ -77,39 +77,56 @@ All 4 runners reconnected to GitHub within seconds and immediately began process
 
 ## Prevention
 
-### Option A — Fix Proxmox node DNS (recommended)
+**Status: implemented.** All three options below are now in place.
 
-Set the Proxmox node's DNS to a server reachable without VPN (e.g., your router or a public resolver). This propagates automatically to all LXC containers.
+### Option A — Fix Proxmox node DNS (done)
 
-In Proxmox UI: **Node → DNS → set DNS server to `192.168.2.1` (router) or `1.1.1.1`**.
-
-Or via shell on the Proxmox host:
+The node's DNS no longer points at the VPN gateway. This propagates to every
+LXC container on the node:
 
 ```bash
 pvesh set /nodes/<node>/dns --dns1 1.1.1.1 --dns2 8.8.8.8
 ```
 
-### Option B — Lock DNS in Terraform (current workaround)
+### Option B — Pin DNS per container in Terraform (done)
 
-The Terraform provisioner already writes a fixed `/etc/resolv.conf` during `terraform apply`:
-
-```hcl
-"printf 'nameserver 1.1.1.1\\nnameserver 8.8.8.8\\n' > /etc/resolv.conf",
-```
-
-This is overridden by Proxmox on container start/restart if the PVE node DNS is misconfigured. To make it permanent, also disable Proxmox's DNS management for this container by adding to `main.tf`:
+`terraform/lxc/main.tf` sets the container's own DNS servers, so the container
+no longer inherits whatever the node happens to have:
 
 ```hcl
-dns {
-  servers = ["1.1.1.1", "8.8.8.8"]
+initialization {
+  dns {
+    servers = var.dns_servers   # ["1.1.1.1", "8.8.8.8"]
+  }
 }
 ```
 
-This sets the DNS via the Proxmox API so the container's `/etc/resolv.conf` is managed by PVE with the correct servers.
+This is an **in-place** container update, not a rebuild. Ansible additionally
+keeps a known-good copy at `/etc/github-runner/resolv.conf.known-good`.
 
-### Option C — Monitoring
+### Option C — Monitoring and self-repair (done)
 
-Add a health check that alerts if `nslookup github.com` fails from the runner container, or monitor the runner services for log entries containing `Runner connect error`.
+`runner-health.timer` runs `/usr/local/bin/runner-health` every 5 minutes, and
+2 minutes after boot — the window in which Proxmox rewrites `/etc/resolv.conf`.
+It checks what jobs actually depend on rather than what `systemctl` reports:
+
+1. `getent hosts github.com` — on failure, restores the known-good resolver
+2. `curl https://api.github.com` — on recovery, restarts every runner service
+3. Per-runner service liveness — restarts a stopped unit
+4. Per-runner registration against the GitHub API — re-registers a dropped
+   runner using the PAT at `/etc/github-runner/pat`
+5. Disk headroom — triggers `runner-cleanup.service` above the threshold
+
+Everything is logged under the `runner-health` journal tag:
+
+```bash
+just health       # run it now and see the verdict
+just health-log   # recent history
+```
+
+**What would have happened on 2026-05-13:** step 1 fails at 06:09, the resolver
+is restored, step 2 confirms recovery, all four runners restart and pick up
+queued jobs. Total outage ~5 minutes instead of ~35 hours.
 
 ---
 

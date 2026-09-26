@@ -1,0 +1,38 @@
+---
+# apt previously ran as a bare `apt-get update && apt-get install` inside a
+# remote-exec provisioner: no retries, no dpkg-lock handling. An
+# unattended-upgrades run overlapping an apply failed the whole deploy.
+
+- name: Wait for any other apt/dpkg holder to release its locks
+  ansible.builtin.shell: |
+    set -eu
+    for _ in $(seq 1 60); do
+      if ! fuser /var/lib/dpkg/lock-frontend /var/lib/apt/lists/lock \
+                  /var/cache/apt/archives/lock >/dev/null 2>&1; then
+        exit 0
+      fi
+      sleep 5
+    done
+    echo "apt/dpkg locks still held after 300s" >&2
+    exit 1
+  changed_when: false
+
+- name: Update the apt cache
+  ansible.builtin.apt:
+    update_cache: true
+    cache_valid_time: 3600
+    lock_timeout: 300
+  register: apt_update
+  retries: 5
+  delay: 15
+  until: apt_update is succeeded
+
+- name: Install runner dependencies
+  ansible.builtin.apt:
+    name: "{{ github_runner_packages }}"
+    state: present
+    lock_timeout: 300
+  register: apt_install
+  retries: 5
+  delay: 15
+  until: apt_install is succeeded

@@ -1,0 +1,17 @@
+{%- set out = [] -%}
+{%- set ns = namespace(idx=0) -%}
+{%- set toks = github_runner_tokens_raw.split(',') if github_runner_tokens_raw | length > 0 else [] -%}
+{%- for target in github_runner_targets -%}
+{%-   set ti = loop.index0 -%}
+{%-   for _j in range(github_runner_parallel | int) -%}
+{%-     set _ = out.append({
+          'index': ns.idx,
+          'target': target,
+          'name': github_runner_name ~ '-' ~ ns.idx,
+          'dir': github_runner_home ~ '/actions-runner-' ~ ns.idx,
+          'token': (toks[ti] | trim) if toks | length > ti else ''
+        }) -%}
+{%-     set ns.idx = ns.idx + 1 -%}
+{%-   endfor -%}
+{%- endfor -%}
+{{ out | to_json }}

@@ -1,0 +1,15 @@
+# Managed by ansible/roles/github_runner — do not edit by hand.
+[Unit]
+# Do not give up on a runner that flaps while the network is down. The upstream
+# unit's default start-limit would leave it dead after a handful of retries.
+StartLimitIntervalSec=0
+
+[Service]
+Restart=always
+RestartSec=15
+
+# A runaway job should be killed, not the runner service that supervises it.
+OOMPolicy=continue
+{% if runner_memory_max | length > 0 %}
+MemoryMax={{ runner_memory_max }}
+{% endif %}

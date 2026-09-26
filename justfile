@@ -38,34 +38,63 @@ apply:
 apply-auto:
 	source .envrc && terraform -chdir={{tf_dir}} apply -var-file=terraform.tfvars -auto-approve
 
-# Generate fresh runner tokens and plan (re-provisions runners)
+# Converge runners via Ansible — no tokens needed, safe to run during CI
+[group('runner')]
+converge:
+	#!/usr/bin/env bash
+	set -euo pipefail
+	export ANSIBLE_CONFIG=ansible/ansible.cfg
+	export GH_RUNNER_PAT="${GH_RUNNER_PAT:-}"
+	ansible-playbook -i ansible/inventory.ini -l gh_runner ansible/playbooks/runners.yml
+
+# Dry-run the Ansible convergence (no changes made)
+[group('runner')]
+converge-check:
+	#!/usr/bin/env bash
+	set -euo pipefail
+	export ANSIBLE_CONFIG=ansible/ansible.cfg
+	ansible-playbook -i ansible/inventory.ini -l gh_runner ansible/playbooks/runners.yml --check --diff
+
+# Mint fresh registration tokens (only needed for NEW runners) and converge
+[group('runner')]
+converge-tokens:
+	#!/usr/bin/env bash
+	set -euo pipefail
+	export ANSIBLE_CONFIG=ansible/ansible.cfg
+	export GH_RUNNER_TOKENS="$(just _tokens)"
+	export GH_RUNNER_PAT="${GH_RUNNER_PAT:-}"
+	ansible-playbook -i ansible/inventory.ini -l gh_runner ansible/playbooks/runners.yml
+
+# Mint one registration token per target, comma-separated, in tfvars order
+[group('runner')]
+[private]
+_tokens:
+	#!/usr/bin/env bash
+	set -euo pipefail
+	TOKEN1=$(gh api --method POST -H "Accept: application/vnd.github+json" \
+	    /repos/bthek1/proxmox_github_runner/actions/runners/registration-token --jq '.token')
+	TOKEN2=$(gh api --method POST -H "Accept: application/vnd.github+json" \
+	    /repos/Recovery-Metrics/RM_DRF_Project/actions/runners/registration-token --jq '.token')
+	TOKEN3=$(gh api --method POST -H "Accept: application/vnd.github+json" \
+	    /repos/bthek1/Stock_Market/actions/runners/registration-token --jq '.token')
+	printf '%s,%s,%s' "${TOKEN1}" "${TOKEN2}" "${TOKEN3}"
+
+# Plan infra + runner provisioning (tokens minted only if you have new runners)
 [group('plan/apply/destroy')]
 runner-plan:
 	#!/usr/bin/env bash
 	set -euo pipefail
 	source .envrc
-	TOKEN1=$(gh api --method POST -H "Accept: application/vnd.github+json" \
-	    /repos/bthek1/proxmox_github_runner/actions/runners/registration-token --jq '.token')
-	TOKEN2=$(gh api --method POST -H "Accept: application/vnd.github+json" \
-	    /repos/Recovery-Metrics/RM_DRF_Project/actions/runners/registration-token --jq '.token')
-	TOKEN3=$(gh api --method POST -H "Accept: application/vnd.github+json" \
-	    /repos/bthek1/Stock_Market/actions/runners/registration-token --jq '.token')
-	export TF_VAR_github_runner_tokens="${TOKEN1},${TOKEN2},${TOKEN3}"
+	export TF_VAR_github_runner_tokens="${TF_VAR_github_runner_tokens:-}"
 	terraform -chdir={{tf_dir}} plan -out=tfplan
 
-# Generate fresh runner tokens, plan, and apply (re-provisions runners)
+# Apply infra, then converge the runners via Ansible
 [group('plan/apply/destroy')]
 runner-apply:
 	#!/usr/bin/env bash
 	set -euo pipefail
 	source .envrc
-	TOKEN1=$(gh api --method POST -H "Accept: application/vnd.github+json" \
-	    /repos/bthek1/proxmox_github_runner/actions/runners/registration-token --jq '.token')
-	TOKEN2=$(gh api --method POST -H "Accept: application/vnd.github+json" \
-	    /repos/Recovery-Metrics/RM_DRF_Project/actions/runners/registration-token --jq '.token')
-	TOKEN3=$(gh api --method POST -H "Accept: application/vnd.github+json" \
-	    /repos/bthek1/Stock_Market/actions/runners/registration-token --jq '.token')
-	export TF_VAR_github_runner_tokens="${TOKEN1},${TOKEN2},${TOKEN3}"
+	export TF_VAR_github_runner_tokens="${TF_VAR_github_runner_tokens:-$(just _tokens)}"
 	terraform -chdir={{tf_dir}} plan -out=tfplan
 	terraform -chdir={{tf_dir}} apply tfplan
 
@@ -102,6 +131,28 @@ runners:
 	gh api /repos/bthek1/proxmox_github_runner/actions/runners --jq '.runners[] | {name, status}'
 	gh api /repos/Recovery-Metrics/RM_DRF_Project/actions/runners --jq '.runners[] | {name, status}'
 	gh api /repos/bthek1/Stock_Market/actions/runners --jq '.runners[] | {name, status}'
+
+# Run the health check on the container right now and show its verdict
+[group('inspect')]
+health:
+	ssh -i ~/.ssh/id_ed25519 root@192.168.2.111 "/usr/local/bin/runner-health"
+
+# Recent health-check and cleanup history from the container's journal
+[group('inspect')]
+health-log:
+	ssh -i ~/.ssh/id_ed25519 root@192.168.2.111 \
+	    "journalctl -t runner-health -t runner-cleanup --no-pager -n 80"
+
+# Show the health and cleanup timer schedules
+[group('inspect')]
+timers:
+	ssh -i ~/.ssh/id_ed25519 root@192.168.2.111 \
+	    "systemctl list-timers 'runner-*' --no-pager"
+
+# Run disk cleanup on the container right now
+[group('inspect')]
+cleanup:
+	ssh -i ~/.ssh/id_ed25519 root@192.168.2.111 "/usr/local/bin/runner-cleanup"
 
 # Check runner systemd services on the container
 [group('inspect')]

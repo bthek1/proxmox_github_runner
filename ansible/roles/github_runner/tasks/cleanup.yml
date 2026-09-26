@@ -1,0 +1,39 @@
+---
+- name: Install the cleanup script
+  ansible.builtin.template:
+    src: runner-cleanup.sh.j2
+    dest: "{{ github_runner_bin_dir }}/runner-cleanup"
+    owner: root
+    group: root
+    mode: "0750"
+
+- name: Install the cleanup unit and timer
+  ansible.builtin.template:
+    src: "runner-cleanup.{{ item }}.j2"
+    dest: "/etc/systemd/system/runner-cleanup.{{ item }}"
+    owner: root
+    group: root
+    mode: "0644"
+  loop: [service, timer]
+  register: cleanup_units
+
+- name: Reload systemd for cleanup
+  ansible.builtin.systemd_service:
+    daemon_reload: true
+  when: cleanup_units is changed
+
+- name: Enable the cleanup timer
+  ansible.builtin.systemd_service:
+    name: runner-cleanup.timer
+    enabled: true
+    state: started
+
+- name: Report current disk usage
+  ansible.builtin.command:
+    argv: [df, -h, /]
+  register: disk_usage
+  changed_when: false
+
+- name: Show current disk usage
+  ansible.builtin.debug:
+    var: disk_usage.stdout_lines

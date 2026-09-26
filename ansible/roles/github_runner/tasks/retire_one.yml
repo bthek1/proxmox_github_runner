@@ -1,0 +1,57 @@
+---
+- name: "retire {{ retired_dir }} | wait for any in-flight job"
+  ansible.builtin.command:
+    argv: ["{{ github_runner_bin_dir }}/gh-runner-drain", "{{ retired_dir }}", "{{ drain_timeout }}"]
+  changed_when: false
+
+- name: "retire {{ retired_dir }} | read registration"
+  ansible.builtin.slurp:
+    src: "{{ retired_dir }}/.runner"
+  register: retired_state
+  failed_when: false
+
+- name: "retire {{ retired_dir }} | stop and uninstall the service"
+  ansible.builtin.command:
+    argv: [./svc.sh, uninstall]
+    chdir: "{{ retired_dir }}"
+  register: retired_uninstall
+  changed_when: retired_uninstall.rc == 0
+  failed_when: false
+
+- name: "retire {{ retired_dir }} | mint a removal token"
+  ansible.builtin.command:
+    argv:
+      - "{{ github_runner_bin_dir }}/gh-runner-token"
+      - "{{ (retired_state.content | b64decode | from_json).gitHubUrl }}"
+      - remove
+  register: retired_removal_token
+  changed_when: false
+  failed_when: false
+  when:
+    - github_pat | length > 0
+    - retired_state.content is defined
+  no_log: true
+
+- name: "retire {{ retired_dir }} | deregister from GitHub"
+  ansible.builtin.command:
+    argv: [./config.sh, remove, --token, "{{ retired_removal_token.stdout | trim }}"]
+    chdir: "{{ retired_dir }}"
+  become: true
+  become_user: "{{ github_runner_user }}"
+  register: retired_remove
+  changed_when: retired_remove.rc == 0
+  failed_when: false
+  when: (retired_removal_token.rc | default(1)) == 0
+  no_log: true
+
+- name: "retire {{ retired_dir }} | warn when it could not be deregistered"
+  ansible.builtin.debug:
+    msg: >-
+      {{ retired_dir }} was stopped but not deregistered (no PAT, or the API
+      call failed). Remove it by hand under Settings -> Actions -> Runners.
+  when: (retired_removal_token.rc | default(1)) != 0
+
+- name: "retire {{ retired_dir }} | remove the directory"
+  ansible.builtin.file:
+    path: "{{ retired_dir }}"
+    state: absent

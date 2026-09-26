@@ -1,0 +1,109 @@
+#!/usr/bin/env bash
+# runner-cleanup — keep the root filesystem from silently filling up.
+#
+# Self-hosted runners are persistent, so every job leaves behind a checkout, a
+# package cache and diagnostic logs. A full disk does not stop the runner
+# services; it makes jobs fail in confusing, unrelated-looking ways. This runs
+# on a timer and again on demand when the health check sees the disk crossing
+# the warning threshold.
+#
+# Job directories in use are never touched: a runner executing a job is skipped
+# entirely.
+set -uo pipefail
+
+RUNNER_HOME="{{ github_runner_home }}"
+BIN_DIR="{{ github_runner_bin_dir }}"
+RETENTION_DAYS={{ work_dir_retention_days }}
+WARN_PERCENT={{ disk_warn_percent }}
+
+log()  { logger -t runner-cleanup -p "user.${1}" -- "${2}"; echo "[${1}] ${2}"; }
+info() { log info "$1"; }
+warn() { log warning "$1"; }
+
+usage_now() { df --output=pcent / | tail -1 | tr -dc '0-9'; }
+free_now()  { df -h --output=avail / | tail -1 | tr -d ' '; }
+
+before_pct="$(usage_now)"
+info "starting: root at ${before_pct}%, ${free_now} free, retention ${RETENTION_DAYS}d"
+
+# A runner is busy if a Runner.Worker process has its cwd inside the directory.
+runner_busy() { ! "${BIN_DIR}/gh-runner-drain" "$1" 0 >/dev/null 2>&1; }
+
+# ── Pass 1: stale job workspaces ─────────────────────────────────────────────
+
+for dir in "${RUNNER_HOME}"/actions-runner-*; do
+  [ -d "$dir" ] || continue
+
+  if runner_busy "$dir"; then
+    info "$(basename "$dir"): executing a job — skipped"
+    continue
+  fi
+
+  work="${dir}/_work"
+  if [ -d "$work" ]; then
+    # Each direct child of _work is one repository's workspace. _tool and
+    # _actions are caches (toolchains, downloaded actions) — pruning those on a
+    # schedule just makes the next run slow, so they are left to the aggressive
+    # pass, which only runs when the disk is genuinely tight.
+    while IFS= read -r -d '' stale; do
+      info "removing stale workspace ${stale} ($(du -sh "$stale" 2>/dev/null | cut -f1))"
+      rm -rf -- "$stale"
+    done < <(find "$work" -mindepth 1 -maxdepth 1 \
+               -not -name '_tool' -not -name '_actions' -not -name '_temp' \
+               -mtime "+${RETENTION_DAYS}" -print0 2>/dev/null)
+
+    # _temp is scratch and is recreated per job; never worth keeping.
+    rm -rf -- "${work}/_temp"/* 2>/dev/null || true
+  fi
+
+  # Runner diagnostic logs are unbounded and rotate only by count.
+  find "${dir}/_diag" -type f -name '*.log' -mtime "+${RETENTION_DAYS}" -delete 2>/dev/null || true
+done
+
+# ── Pass 2: system-level caches ──────────────────────────────────────────────
+
+journalctl --vacuum-time="${RETENTION_DAYS}d" >/dev/null 2>&1 \
+  && info "journal vacuumed to ${RETENTION_DAYS}d"
+
+apt-get clean >/dev/null 2>&1 && info "apt cache cleaned"
+
+if command -v docker >/dev/null 2>&1 && docker info >/dev/null 2>&1; then
+  docker system prune -af --filter "until=${RETENTION_DAYS}x24h" >/dev/null 2>&1 \
+    && info "docker images/containers pruned"
+fi
+
+for cache in "${RUNNER_HOME}/.cache/pip" "${RUNNER_HOME}/.npm/_cacache" "${RUNNER_HOME}/.cache/uv"; do
+  [ -d "$cache" ] && find "$cache" -mindepth 1 -mtime "+${RETENTION_DAYS}" -delete 2>/dev/null || true
+done
+
+# ── Pass 3: escalate if still tight ──────────────────────────────────────────
+
+mid_pct="$(usage_now)"
+if [ -n "$mid_pct" ] && [ "$mid_pct" -ge "$WARN_PERCENT" ]; then
+  warn "root still at ${mid_pct}% after routine cleanup — escalating to aggressive pruning"
+
+  for dir in "${RUNNER_HOME}"/actions-runner-*; do
+    [ -d "$dir" ] || continue
+    runner_busy "$dir" && continue
+    # Ignore retention entirely: a full disk breaks every job, a cold checkout
+    # costs one slow run.
+    rm -rf -- "${dir}/_work"/* 2>/dev/null || true
+  done
+
+  journalctl --vacuum-size=100M >/dev/null 2>&1 || true
+  if command -v docker >/dev/null 2>&1 && docker info >/dev/null 2>&1; then
+    docker system prune -af --volumes >/dev/null 2>&1 || true
+  fi
+  rm -rf -- "${RUNNER_HOME}/.cache"/* 2>/dev/null || true
+fi
+
+after_pct="$(usage_now)"
+info "finished: root ${before_pct}% -> ${after_pct}%, ${free_now} free"
+
+if [ -n "$after_pct" ] && [ "$after_pct" -ge "$WARN_PERCENT" ]; then
+  # Deliberately loud and non-zero: cleanup can no longer keep up, which means
+  # the disk needs growing or the fleet needs shrinking.
+  warn "root filesystem still at ${after_pct}% (threshold ${WARN_PERCENT}%) after aggressive cleanup — grow the disk or reduce github_runner_parallel"
+  exit 1
+fi
+exit 0

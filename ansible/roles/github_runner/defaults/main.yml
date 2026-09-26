@@ -1,0 +1,50 @@
+---
+# ── Fleet shape ───────────────────────────────────────────────────────────────
+github_runner_targets: []
+github_runner_parallel: 2
+github_runner_name: proxmox-lxc-runner
+github_runner_labels: ["self-hosted", "linux", "proxmox"]
+github_runner_user: runner
+github_runner_version: "2.316.1"
+
+# Comma-separated registration tokens, one per target, in target order.
+# Only consumed for runners that are not already registered.
+github_runner_tokens_raw: ""
+
+# Optional PAT (repo + workflow scope). Stored at /etc/github-runner/pat so the
+# health check can mint its own registration tokens and recover unattended.
+github_pat: ""
+
+# ── Paths ─────────────────────────────────────────────────────────────────────
+github_runner_home: "/home/{{ github_runner_user }}"
+github_runner_conf_dir: /etc/github-runner
+github_runner_bin_dir: /usr/local/bin
+
+# ── Resilience ────────────────────────────────────────────────────────────────
+dns_servers: ["1.1.1.1", "8.8.8.8"]
+health_check_interval: 5min
+cleanup_schedule: daily
+work_dir_retention_days: 7
+disk_warn_percent: 80
+# Empty by default: capping memory is part of the CPU/RAM oversubscription fix,
+# which is out of scope here. Set to e.g. "2G" to enable.
+runner_memory_max: ""
+
+# Seconds to wait for a runner to finish its current job before touching it.
+drain_timeout: 1800
+
+# Packages the runners need at job time. Kept here rather than in a workflow so
+# a rebuilt container is job-ready without a first-run failure.
+github_runner_packages:
+  - curl
+  - git
+  - jq
+  - ca-certificates
+  - libssl-dev
+  - libpango-1.0-0
+  - libpangoft2-1.0-0
+  - libcairo2
+  - libgdk-pixbuf2.0-0
+  - libffi-dev
+  - shared-mime-info
+  - fonts-liberation
